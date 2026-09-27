@@ -1,0 +1,49 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: evops-base
+  profiles:
+    active: dev
+  jackson:
+    time-zone: Asia/Shanghai
+    serialization:
+      write-dates-as-timestamps: false
+  datasource:
+    url: jdbc:h2:file:./data/evops;AUTO_SERVER=TRUE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  h2:
+    console:
+      enabled: false
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: com.evops
+  configuration:
+    map-underscore-to-camel-case: true
+
+# 对账周期任务（recon-1）：cron 可配，改点不动代码；enabled=false 为应急总开关
+evops:
+  recon:
+    enabled: true
+    # 夜间配置批处理：白天排队的配置变更统一在此时校验生效（默认每天 02:00）
+    config-apply-cron: "0 0 2 * * ?"
+    # 凌晨日结对账：拉前一业务日双方流水勾稽并出对账单（默认每天 03:00）
+    daily-recon-cron: "0 0 3 * * ?"
+  # 车载定位平台文件往来（telematics-1）
+  telematics:
+    # 导出文件归档根目录（按业务日 yyyyMMdd 分目录落盘）
+    export-dir: data/telematics/export
+    # 文件往来字符集（与对方规范一致，如对方要求 GBK 改此配置）
+    charset: UTF-8
+
+logging:
+  level:
+    com.evops: INFO
