@@ -6,6 +6,10 @@ import com.evops.common.BizException;
 import com.evops.rental.dto.HandoverRequest;
 import com.evops.rental.dto.OrderCreateRequest;
 import com.evops.rental.dto.ReturnSettleRequest;
+import com.evops.rental.fsm.RentalOrderTransition;
+import com.evops.rental.fsm.RentalOrderTransitionMapper;
+import com.evops.rental.fsm.RentalStateMachine;
+import com.evops.rental.fsm.RentalStateMachineConfig;
 import com.evops.vehicle.Vehicle;
 import com.evops.vehicle.VehicleMapper;
 import org.springframework.stereotype.Service;
@@ -19,13 +23,20 @@ import java.util.concurrent.ThreadLocalRandom;
 /**
  * 租车单主流程。
  *
- * 状态机：
+ * 交车生命周期为<b>配置驱动状态机</b>（见 {@link RentalStateMachineConfig}，合法路径集中在
+ * application.yml）：
+ * <pre>
  *   下单 CREATED --交车--> RENTING --还车结算--> SETTLED --归档--> ARCHIVED
  *   SETTLED / ARCHIVED --冲销--> REVERSED
+ * </pre>
+ * 越级、回退、未知动作都因“不在合法路径内”由状态机统一拒绝（409）；
+ * 新增状态/动作只改配置，通用流转接口 /transitions 直接承载，不改代码。
  *
  * 规则：
- * - 每个业务动作的多表写入（订单、交接、事件、车辆状态）共用一个事务，中途失败全部回退；
- * - 租车单全量留痕，不提供物理删除；已结算/已归档只允许冲销；
+ * - 每次状态推进走乐观锁 CAS，并行流转只有一个成功，败者整体回滚（见 {@link RentalStateMachine}）；
+ * - 每次流转同事务写结构化流转历史 t_rental_order_transition，链完整可追溯；
+ * - 每个业务动作的多表写入（订单、交接、事件、流转历史、车辆状态）共用一个事务，中途失败全部回退；
+ * - 租车单全量留痕，不提供物理删除；
  * - 交车、还车都必须登记油量表读数与车损照片；
  * - 订单号库层唯一约束兜底重复提交（入口幂等拦截见 IdempotentInterceptor）。
  */
@@ -37,25 +48,34 @@ public class RentalService {
     private final RentalOrderMapper orderMapper;
     private final RentalHandoverMapper handoverMapper;
     private final RentalOrderEventMapper eventMapper;
+    private final RentalOrderTransitionMapper transitionMapper;
     private final VehicleMapper vehicleMapper;
     private final NameIndexService nameIndexService;
     private final NameSearchGrayGate nameSearchGrayGate;
+    private final RentalStateMachine stateMachine;
+    private final RentalStateMachineConfig fsmConfig;
 
     public RentalService(RentalOrderMapper orderMapper,
                          RentalHandoverMapper handoverMapper,
                          RentalOrderEventMapper eventMapper,
+                         RentalOrderTransitionMapper transitionMapper,
                          VehicleMapper vehicleMapper,
                          NameIndexService nameIndexService,
-                         NameSearchGrayGate nameSearchGrayGate) {
+                         NameSearchGrayGate nameSearchGrayGate,
+                         RentalStateMachine stateMachine,
+                         RentalStateMachineConfig fsmConfig) {
         this.orderMapper = orderMapper;
         this.handoverMapper = handoverMapper;
         this.eventMapper = eventMapper;
+        this.transitionMapper = transitionMapper;
         this.vehicleMapper = vehicleMapper;
         this.nameIndexService = nameIndexService;
         this.nameSearchGrayGate = nameSearchGrayGate;
+        this.stateMachine = stateMachine;
+        this.fsmConfig = fsmConfig;
     }
 
-    /** 下单：订单 CREATED + CREATE 事件，同一事务。 */
+    /** 下单：订单落状态机初始状态 + CREATE 事件，同一事务。 */
     @Transactional(rollbackFor = Exception.class)
     public RentalOrder createOrder(OrderCreateRequest request) {
         Vehicle vehicle = vehicleMapper.selectById(request.getVehicleId());
@@ -73,7 +93,7 @@ public class RentalService {
         order.setCustomerName(request.getCustomerName());
         order.setBranchCode(request.getBranchCode() == null || request.getBranchCode().trim().isEmpty()
                 ? null : request.getBranchCode().trim());
-        order.setStatus(OrderStatus.CREATED);
+        order.setStatus(fsmConfig.getInitialStatus());
         orderMapper.insert(order);
 
         recordEvent(order.getId(), EventType.CREATE,
@@ -84,22 +104,20 @@ public class RentalService {
         return order;
     }
 
-    /** 交车：登记油量/车损照片，订单 CREATED -> RENTING，车辆置 RENTING。 */
+    /** 交车：登记油量/车损照片，状态机推进交车动作，车辆置 RENTING。 */
     @Transactional(rollbackFor = Exception.class)
     public RentalOrder pickup(Long orderId, HandoverRequest request) {
         RentalOrder order = requireOrder(orderId);
-        if (!OrderStatus.CREATED.equals(order.getStatus())) {
-            throw new BizException("只有已下单(CREATED)的订单可以交车，当前状态：" + order.getStatus());
-        }
+        // 越级/回退先由状态机拒绝（与车辆现场状态无关），再做车辆在库校验
+        fsmConfig.requireRule(EventType.PICKUP, order.getStatus());
         Vehicle vehicle = requireVehicle(order.getVehicleId());
         if (!"IDLE".equals(vehicle.getStatus())) {
             throw new BizException("车辆不在库，无法交车，当前状态：" + vehicle.getStatus());
         }
 
-        insertHandover(orderId, "PICKUP", request);
+        RentalHandover handover = insertHandover(orderId, "PICKUP", request);
+        fireTransition(order, EventType.PICKUP, handover.getId(), null);
 
-        order.setStatus(OrderStatus.RENTING);
-        orderMapper.updateById(order);
         vehicle.setStatus("RENTING");
         vehicleMapper.updateById(vehicle);
 
@@ -108,20 +126,16 @@ public class RentalService {
         return orderMapper.selectById(orderId);
     }
 
-    /** 还车并结算：登记油量/车损照片，订单 RENTING -> SETTLED，车辆回 IDLE。 */
+    /** 还车并结算：登记油量/车损照片，状态机推进还车动作，车辆回 IDLE。 */
     @Transactional(rollbackFor = Exception.class)
     public RentalOrder returnAndSettle(Long orderId, ReturnSettleRequest request) {
         RentalOrder order = requireOrder(orderId);
-        if (!OrderStatus.RENTING.equals(order.getStatus())) {
-            throw new BizException("只有租用中(RENTING)的订单可以还车，当前状态：" + order.getStatus());
-        }
         Vehicle vehicle = requireVehicle(order.getVehicleId());
 
-        insertHandover(orderId, "RETURN", request);
+        RentalHandover handover = insertHandover(orderId, "RETURN", request);
 
-        order.setStatus(OrderStatus.SETTLED);
         order.setSettleAmount(request.getSettleAmount());
-        orderMapper.updateById(order);
+        fireTransition(order, EventType.RETURN, handover.getId(), null);
 
         if ("RENTING".equals(vehicle.getStatus())) {
             vehicle.setStatus("IDLE");
@@ -135,41 +149,57 @@ public class RentalService {
         return orderMapper.selectById(orderId);
     }
 
-    /** 归档：SETTLED -> ARCHIVED。 */
+    /** 归档：状态机推进归档动作。 */
     @Transactional(rollbackFor = Exception.class)
     public RentalOrder archive(Long orderId) {
         RentalOrder order = requireOrder(orderId);
-        if (!OrderStatus.SETTLED.equals(order.getStatus())) {
-            throw new BizException("只有已结算(SETTLED)的订单可以归档，当前状态：" + order.getStatus());
-        }
-        order.setStatus(OrderStatus.ARCHIVED);
-        orderMapper.updateById(order);
+        fireTransition(order, EventType.ARCHIVE, null, null);
         recordEvent(orderId, EventType.ARCHIVE, "订单归档");
         return orderMapper.selectById(orderId);
     }
 
     /**
-     * 冲销：已结算/已归档只许冲销、不许物理删除。
-     * SETTLED / ARCHIVED -> REVERSED，并确保车辆已回库。
+     * 冲销：已结算/已归档的唯一撤销方式，合法起始状态由状态机配置集中定义。
+     * 冲销后确保车辆已回库。
      */
     @Transactional(rollbackFor = Exception.class)
     public RentalOrder reverse(Long orderId, String reason) {
         RentalOrder order = requireOrder(orderId);
-        if (!OrderStatus.SETTLED.equals(order.getStatus())
-                && !OrderStatus.ARCHIVED.equals(order.getStatus())) {
-            throw new BizException("只有已结算(SETTLED)或已归档(ARCHIVED)的记录允许冲销，当前状态："
-                    + order.getStatus());
-        }
+        String trimmedReason = reason == null ? null : reason.trim();
+        fireTransition(order, EventType.REVERSE, null, trimmedReason);
+
         Vehicle vehicle = vehicleMapper.selectById(order.getVehicleId());
         if (vehicle != null && "RENTING".equals(vehicle.getStatus())) {
             vehicle.setStatus("IDLE");
             vehicleMapper.updateById(vehicle);
         }
 
-        order.setStatus(OrderStatus.REVERSED);
-        orderMapper.updateById(order);
         recordEvent(orderId, EventType.REVERSE,
-                "订单冲销" + (reason != null && !reason.trim().isEmpty() ? "，原因：" + reason.trim() : ""));
+                "订单冲销" + (trimmedReason != null && !trimmedReason.isEmpty()
+                        ? "，原因：" + trimmedReason : ""));
+        return orderMapper.selectById(orderId);
+    }
+
+    /**
+     * 通用状态流转：动作与起止状态全部取自状态机配置。
+     * 新增状态/动作后无需改代码、无需发版，现场直接按配置的 action 调用。
+     * 带交接的专属动作（交车/还车）仍走各自接口以强制油量/照片登记。
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public RentalOrder transition(Long orderId, String action, String remark) {
+        RentalOrder order = requireOrder(orderId);
+        String act = action == null ? null : action.trim().toUpperCase();
+        if (act == null || act.isEmpty()) {
+            throw new BizException("流转动作不能为空");
+        }
+        if (EventType.PICKUP.equals(act) || EventType.RETURN.equals(act)) {
+            throw new BizException(act + " 必须登记油量表读数与车损照片，请使用交车/还车专属接口");
+        }
+        String trimmedRemark = remark == null ? null : remark.trim();
+        RentalOrderTransition transition = fireTransition(order, act, null, trimmedRemark);
+        recordEvent(orderId, act, "状态流转：" + transition.getFromStatus() + " -> "
+                + transition.getToStatus()
+                + (trimmedRemark != null && !trimmedRemark.isEmpty() ? "，备注：" + trimmedRemark : ""));
         return orderMapper.selectById(orderId);
     }
 
@@ -244,10 +274,31 @@ public class RentalService {
                 new LambdaQueryWrapper<RentalOrderEvent>()
                         .eq(RentalOrderEvent::getOrderId, orderId)
                         .orderByAsc(RentalOrderEvent::getId));
-        return new RentalOrderDetail(order, handovers, events);
+        List<RentalOrderTransition> transitions = listTransitions(orderId);
+        return new RentalOrderDetail(order, handovers, events, transitions);
+    }
+
+    /** 流转历史：按发生顺序返回完整状态链（每次流转一行，可追溯到交接/操作人/请求号）。 */
+    public List<RentalOrderTransition> listTransitions(Long orderId) {
+        requireOrder(orderId);
+        return transitionMapper.selectList(
+                new LambdaQueryWrapper<RentalOrderTransition>()
+                        .eq(RentalOrderTransition::getOrderId, orderId)
+                        .orderByAsc(RentalOrderTransition::getId));
+    }
+
+    /** 状态机合法路径视图（集中定义的配置原样可读）。 */
+    public RentalStateMachineConfig stateMachineView() {
+        return fsmConfig;
     }
 
     // ---- 内部辅助 ----
+
+    /** 推进状态机：合法路径判定 + CAS 更新 + 流转历史，同一事务。 */
+    private RentalOrderTransition fireTransition(RentalOrder order, String action,
+                                                 Long handoverId, String remark) {
+        return stateMachine.fire(order, action, handoverId, remark);
+    }
 
     private RentalOrder requireOrder(Long orderId) {
         RentalOrder order = orderMapper.selectById(orderId);
@@ -265,7 +316,7 @@ public class RentalService {
         return vehicle;
     }
 
-    private void insertHandover(Long orderId, String type, HandoverRequest request) {
+    private RentalHandover insertHandover(Long orderId, String type, HandoverRequest request) {
         RentalHandover handover = new RentalHandover();
         handover.setOrderId(orderId);
         handover.setType(type);
@@ -273,6 +324,7 @@ public class RentalService {
         handover.setDamagePhotos(request.getDamagePhotos());
         handover.setRemark(request.getRemark());
         handoverMapper.insert(handover);
+        return handover;
     }
 
     private void recordEvent(Long orderId, String eventType, String detail) {
@@ -288,7 +340,7 @@ public class RentalService {
                 + String.format("%04d", ThreadLocalRandom.current().nextInt(10000));
     }
 
-    /** 订单状态常量 */
+    /** 订单状态常量（默认配置中的状态名；新增状态以 application.yml 配置为准） */
     public static final class OrderStatus {
         public static final String CREATED = "CREATED";
         public static final String RENTING = "RENTING";
@@ -299,7 +351,7 @@ public class RentalService {
         private OrderStatus() {}
     }
 
-    /** 事件类型常量 */
+    /** 事件类型常量（流转事件动作名与状态机配置一致；RENAME 为非状态业务动作） */
     public static final class EventType {
         public static final String CREATE = "CREATE";
         public static final String PICKUP = "PICKUP";

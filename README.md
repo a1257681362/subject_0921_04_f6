@@ -275,3 +275,55 @@ SETTLED / ARCHIVED --冲销--> REVERSED
 ### 测试
 
 `mvn test`：新增 6 个集成用例覆盖导出转义与空值/空串区分、CRLF 与 UTF-8、按日期归档落盘、模板下载、导入成功与同文件重复导入幂等、同设备不同文件覆盖、失败行号明细与全或无（合法行也不落库）、表头不符与引号未闭合报错。回归聚焦交车主链路：既有 RentalFlowIntegrationTest 9 用例不动、全量测试通过。
+
+## 交车生命周期状态机（rental-fsm-1）
+
+背景：调度员带人到现场处理过几次，越级操作、误点回退、两人同时操作同一单，每次都手忙脚乱。本期把交车生命周期管住：**状态机配置驱动，合法路径集中定义，越级与回退按规则拒绝，流转历史完整可追溯；并行流转只有一个成功；新增状态不改代码。**
+
+### 合法路径集中配置（不再散落在代码 if 里）
+
+`application.yml` 的 `evops.rental.fsm.transitions` 是合法路径全集，每条 = 动作 + 起始状态 + 目标状态：
+
+```
+CREATED --PICKUP交车--> RENTING --RETURN还车结算--> SETTLED --ARCHIVE归档--> ARCHIVED
+SETTLED / ARCHIVED --REVERSE冲销(forward:false)--> REVERSED
+```
+
+- 启动即校验配置（action/from/to 必填、同动作同状态不许配两个目标、至少一条规则），配错快速失败；
+- **越级**（CREATED 直接 ARCHIVE）、**回退**（RENTING 再 PICKUP、REVERSED 再 ARCHIVE）、**未知动作**都因“不在合法路径内”由同一出口拒绝（409，提示该动作允许的起始状态）；
+- `forward: false` 仅标注显式允许的逆向动作（冲销），配置之外的逆向一律拒绝。
+
+### 并行流转只有一个成功（乐观锁 CAS）
+
+状态推进统一经引擎执行 `UPDATE t_rental_order SET status=?, version=version+1 WHERE id=? AND version=?`：
+
+- 现场重复点交车、调度与网点同时操作同一单，影响行数=1 的事务成功，败者影响行数=0 抛“并发冲突”，**整个业务事务回滚**（交接/事件/流转历史都不落半截）；
+- 订单原有 `version` 乐观锁继续作为并发兜底，无需新增锁机制。
+
+### 流转历史完整可追溯（查什么都能对上）
+
+新增结构化流转历史 `t_rental_order_transition`，每次成功流转在业务事务内落一行：动作、起止状态、流转前后版本、关联交接记录 id（交车/还车可直接对到油量与车损照片）、备注/原因、操作人、业务时间、请求号。
+
+- `GET /api/orders/{id}/transitions` 按发生顺序返回完整状态链；订单详情内嵌同一链；
+- 与既有事件流水 `t_rental_order_event` 分工：事件记业务动作叙述（含改名等非状态动作），流转历史只记状态机变化、字段结构化；
+- 交接记录、事件、流转历史三者靠 order_id / handover_id / request_no 互相对得上。
+
+### 新增状态不改代码
+
+- 库层不再用 CHECK 枚举锁死订单状态（既有库启动时自动 `DROP CONSTRAINT` + 列扩容到 VARCHAR(32)，幂等），新状态落库不需要改表；
+- 新增状态/动作只在 `evops.rental.fsm.transitions` 加规则（如 `RENTING --INSPECT--> INSPECTING --INSPECT_DONE--> RENTING`）；
+- 纯状态动作经通用接口 `POST /api/orders/{id}/transitions {"action":"...","remark":"..."}` 直接承载；交车/还车因强制登记油量与车损照片，仍走专属接口（通用接口明确拒绝）。
+
+### 接口速览（新增）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | /api/orders/state-machine | 合法路径视图（初始状态、全部规则、正向/逆向标注、动作与状态中文名） |
+| GET | /api/orders/{id}/transitions | 状态流转历史（按顺序，可追溯到交接/操作人/请求号/版本） |
+| POST | /api/orders/{id}/transitions | 通用状态流转（动作取配置；PICKUP/RETURN 请走专属接口） |
+
+既有 pickup/return/archive/reverse 接口不变，内部全部改走状态机引擎，越级/回退返回 409。
+
+### 测试
+
+`mvn test`：新增 8 个集成用例覆盖合法路径流转链（首尾相接/版本连续/交接关联/冲销原因）、越级拒绝不留痕、回退与终态拒绝、未知动作拒绝、交车不可走通用接口、并行 CAS 只有一个成功且败者回滚无半截历史、配置新增状态（HELD/INSPECTING）不改代码经通用接口流转、状态机视图。全量 47 个用例通过（含既有 9 个主流程用例零改动回归）。

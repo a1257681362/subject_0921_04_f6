@@ -31,6 +31,31 @@ mybatis-plus:
 
 # 对账周期任务（recon-1）：cron 可配，改点不动代码；enabled=false 为应急总开关
 evops:
+  # 交车生命周期状态机（rental-fsm-1）：合法路径集中在此配置，代码不硬编码状态判断。
+  # 越级（如 CREATED 直接 ARCHIVE）、回退（如 RENTING 退回 CREATED）、未知动作都因
+  # “不在合法路径内”被统一拒绝。新增状态/动作只在此加规则并重启生效，不改代码；
+  # 纯状态动作经 POST /api/orders/{id}/transitions 直接承载。
+  # 交车/还车为专属动作（必须登记油量与车损照片），不在通用流转接口开放。
+  rental:
+    fsm:
+      initial-status: CREATED
+      status-names:
+        CREATED: 已下单
+        RENTING: 租用中
+        SETTLED: 已结算
+        ARCHIVED: 已归档
+        REVERSED: 已冲销
+      action-names:
+        PICKUP: 交车
+        RETURN: 还车结算
+        ARCHIVE: 归档
+        REVERSE: 冲销
+      transitions:
+        - { action: PICKUP,  from: CREATED,  to: RENTING,  forward: true,  note: 交车，须登记油量与车损照片 }
+        - { action: RETURN,  from: RENTING,  to: SETTLED,  forward: true,  note: 还车结算，须登记油量与车损照片 }
+        - { action: ARCHIVE, from: SETTLED,  to: ARCHIVED, forward: true,  note: 已结算单据归档 }
+        - { action: REVERSE, from: SETTLED,  to: REVERSED, forward: false, note: 已结算冲销（唯一撤销方式） }
+        - { action: REVERSE, from: ARCHIVED, to: REVERSED, forward: false, note: 已归档冲销（唯一撤销方式） }
   recon:
     enabled: true
     # 夜间配置批处理：白天排队的配置变更统一在此时校验生效（默认每天 02:00）

@@ -8,6 +8,9 @@ import com.evops.rental.dto.OrderCreateRequest;
 import com.evops.rental.dto.RenameCustomerRequest;
 import com.evops.rental.dto.ReverseRequest;
 import com.evops.rental.dto.ReturnSettleRequest;
+import com.evops.rental.dto.TransitionRequest;
+import com.evops.rental.fsm.RentalOrderTransition;
+import com.evops.rental.fsm.RentalStateMachineConfig;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -104,10 +107,35 @@ public class RentalOrderController {
         return ApiResponse.ok(Collections.singletonMap("rebuilt", nameIndexService.rebuildAll()));
     }
 
-    /** 详情：订单 + 交接记录 + 事件流水 */
+    /** 详情：订单 + 交接记录 + 事件流水 + 状态流转历史 */
     @GetMapping("/{id}")
     public ApiResponse<RentalOrderDetail> detail(@PathVariable Long id) {
         return ApiResponse.ok(rentalService.detail(id));
+    }
+
+    /**
+     * 状态机合法路径视图：集中定义的合法流转（动作/起止状态/是否正向/备注）。
+     * 现场照此操作，越级与回退均不在视图内。
+     */
+    @GetMapping("/state-machine")
+    public ApiResponse<RentalStateMachineConfig> stateMachine() {
+        return ApiResponse.ok(rentalService.stateMachineView());
+    }
+
+    /** 状态流转历史：每次流转一行，按发生顺序返回，可对到交接记录/操作人/业务时间/请求号。 */
+    @GetMapping("/{id}/transitions")
+    public ApiResponse<java.util.List<RentalOrderTransition>> transitions(@PathVariable Long id) {
+        return ApiResponse.ok(rentalService.listTransitions(id));
+    }
+
+    /**
+     * 通用状态流转：动作以状态机配置为准，新增状态/动作只改配置不改代码。
+     * 交车/还车因强制登记油量与车损照片，仍走专属接口。
+     */
+    @PostMapping("/{id}/transitions")
+    public ApiResponse<RentalOrder> transition(@PathVariable Long id,
+                                               @Valid @RequestBody TransitionRequest request) {
+        return ApiResponse.ok(rentalService.transition(id, request.getAction(), request.getRemark()));
     }
 
     /**
