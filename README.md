@@ -59,6 +59,46 @@ SETTLED / ARCHIVED --冲销--> REVERSED
 
 `mvn test`：9 个集成用例覆盖主流程、重复提交拦截、订单号唯一兜底、多表写入事务回滚、删除/冲销规则、组合检索、入参校验。
 
+## 订单状态机（rental-state-machine-1）
+
+背景：调度员带人现场处理交车，越级、回退、并行操作层出不穷，事后对不上账。本期把交车生命周期收进配置驱动的状态机：合法路径集中定义在库表，越级与回退按规则拒绝，每次流转全程留痕，并行流转只有一个成功，新增状态不改代码。
+
+### 合法路径集中定义（配置驱动）
+
+`t_rental_transition_rule` 集中定义全部合法流转路径（源状态 + 动作 -> 目标状态），每次流转按 (当前状态, 动作) 查规则，运行时生效：
+
+- 主流程种子路径（`built_in=ON`，配置接口禁改）：`CREATED --PICKUP--> RENTING --RETURN--> SETTLED --ARCHIVE--> ARCHIVED`，`SETTLED/ARCHIVED --REVERSE--> REVERSED`；
+- **越级与回退按规则拒绝**：未配置/已停用的路径一律 409，报文给出当前状态的合法出路（如 `当前状态 CREATED 不允许执行 RETURN；当前可执行：PICKUP->RENTING`）；
+- **新增状态不改代码**：`POST /api/orders/state-machine/transitions` 插入规则行即生效（如 `SETTLED --RECHECK--> RECHECKED`），状态与动作名不区分大小写、落库统一大写；库层状态 CHECK 约束已退役，合法状态全集以规则表为准；
+- 规则可停用（`enabled=OFF` 立即失效）；行上自带操作人/业务时间/请求号留痕。
+
+### 两条流转通路（都过同一状态机裁决）
+
+- **专用接口**（pickup/return/archive/reverse）：承载业务规则——交/还车必须登记油量表读数与车损照片、车辆状态联动、结算金额；保留动作 `PICKUP/RETURN/ARCHIVE/REVERSE` 的 `open_api` 恒为 OFF；
+- **通用流转入口** `POST /api/orders/{id}/transitions {"action":"RECHECK"}`：只执行 `open_api=ON` 的自定义动作——新增状态/路径即配即用，不改代码；新状态也可配置接入既有专用接口（如配 `RECHECKED --ARCHIVE--> ARCHIVED` 后直接调 `/archive`）。
+
+### 流转历史完整可追溯
+
+`t_rental_order_transition` 每次成功流转写一行（含初始创建 `from_status=NULL`）：从哪到哪、动作、操作人、业务时间、请求号，与订单更新同一事务、失败一起回滚。链条逐行衔接（上行目标状态 = 下行源状态），末行目标状态即订单当前状态。`GET /api/orders/{id}` 详情同视图返回订单+交接+事件+流转，查什么都对得上；`GET /api/orders/{id}/transitions` 单查流转链。
+
+### 并行流转只有一个成功
+
+订单更新走 `version` 乐观锁并检查影响行数：多个现场终端同时流转同一订单，只有一个提交成功，其余 409（`订单已被并发修改，请刷新后重试`）整体回滚——交接、事件、流转历史不留半截。
+
+### 接口速览（新增）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | /api/orders/state-machine/transitions | 合法路径全量列表（含停用），集中定义可查 |
+| POST | /api/orders/state-machine/transitions | 新增/调整流转路径（新增状态不改代码；内置路径禁改） |
+| POST | /api/orders/{id}/transitions | 通用流转入口（仅 open_api=ON 的自定义动作） |
+| GET | /api/orders/{id}/transitions | 流转历史（从哪到哪/谁/何时/哪个请求） |
+| GET | /api/orders/{id} | 详情新增 transitions 字段（订单+交接+事件+流转同视图） |
+
+### 测试
+
+`mvn test`：新增 5 个集成用例覆盖越级/回退拒绝与出路提示、流转历史链条衔接与四要素留痕、4 线程并行交车只有一个成功（交接/事件/流转各只留一份）、配置新状态新路径不改代码即生效并接入既有专用接口、通用入口与规则管理保护（保留动作/内置路径/初始动作/自环/非法名/停用即失效）。
+
 ## 客户姓名拼音检索（rental-name-search-1）
 
 背景：总部稽核要求客户姓名记不全也能检索。为租车单客户姓名建拼音索引，基于 pinyin4j 生成全拼与首字母，读路径经库表灰度开关控制，可在线即时回退。

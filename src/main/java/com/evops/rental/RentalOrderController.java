@@ -8,6 +8,7 @@ import com.evops.rental.dto.OrderCreateRequest;
 import com.evops.rental.dto.RenameCustomerRequest;
 import com.evops.rental.dto.ReverseRequest;
 import com.evops.rental.dto.ReturnSettleRequest;
+import com.evops.rental.dto.TransitRequest;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -22,6 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
 import javax.validation.Valid;
 import java.time.LocalDateTime;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -71,6 +73,23 @@ public class RentalOrderController {
     }
 
     /**
+     * 通用流转入口：执行状态机配置表中 open_api=ON 的动作。
+     * 新增状态/路径在规则表配置后即配即用，不改代码；
+     * 保留动作（交车/还车/归档/冲销）必须走专用接口，本入口一律拒绝。
+     */
+    @PostMapping("/{id}/transitions")
+    public ApiResponse<RentalOrder> transit(@PathVariable Long id,
+                                            @Valid @RequestBody TransitRequest request) {
+        return ApiResponse.ok(rentalService.transit(id, request));
+    }
+
+    /** 流转历史：每次状态流转一行（从哪到哪/动作/谁/何时/哪个请求），全程可追溯 */
+    @GetMapping("/{id}/transitions")
+    public ApiResponse<List<OrderTransition>> transitions(@PathVariable Long id) {
+        return ApiResponse.ok(rentalService.transitions(id));
+    }
+
+    /**
      * 组合检索。customerName 支持姓名原文（中文/外文）、全拼、首字母，
      * 大小写与全半角容错，结果按相关度排序；该参数仅在拼音检索灰度开启时生效。
      */
@@ -104,7 +123,7 @@ public class RentalOrderController {
         return ApiResponse.ok(Collections.singletonMap("rebuilt", nameIndexService.rebuildAll()));
     }
 
-    /** 详情：订单 + 交接记录 + 事件流水 */
+    /** 详情：订单 + 交接记录 + 事件流水 + 状态流转（同视图返回，查什么都对得上） */
     @GetMapping("/{id}")
     public ApiResponse<RentalOrderDetail> detail(@PathVariable Long id) {
         return ApiResponse.ok(rentalService.detail(id));
